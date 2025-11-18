@@ -1,0 +1,16 @@
+export NUM_RESPONSE=16
+export BLOCK_SIZE=4
+export DENOISING_STEPS=4
+export MAX_TOKEN=8192
+export MODEL=sdar
+export MODEL_PATH=${MODEL_PATH:-/inspire/hdd/global_user/liuxiaoran-240108120089/public/TraDo-8B-Instruct}
+export THINK=${THINK:-False}
+export DATASET_TYPE=math
+export EVAL_DATASET=${EVAL_DATASET:-MATH500}
+export REMASKING_STRATEGY=low_confidence_dynamic
+export TEMPERATURE=1.0
+export TOP_K=50
+export TOP_P=1.0
+export DYNAMIC_THRESHOLD=0.9
+export DO_SAMPLE=True
+bash scripts/eval_template.sh
