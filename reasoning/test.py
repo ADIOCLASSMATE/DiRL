@@ -10,7 +10,7 @@ if __name__ == '__main__':
     # Initialize accelerator for multi-node multi-GPU support
     accelerator = Accelerator()
     
-    model_path = '/inspire/hdd/global_user/liuxiaoran-240108120089/zhuying/DiRL/sft_think_32k_latest/ckpt/checkpoint-step-180'
+    model_path = 'xxx/'
     print(model_path)
 
     question = "What is $1^{(2^{235423523})}$?"
@@ -22,7 +22,7 @@ if __name__ == '__main__':
     # ]
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     prompts = tokenizer.apply_chat_template(prompts, tokenize=False,add_generation_prompt=True)
-    prompts = [x+"<think>" for x in prompts]
+    prompts = [x for x in prompts]
     print(prompts)
     print(tokenizer.encode(prompts[0]))
     backend_config = PytorchEngineConfig(
