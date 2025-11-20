@@ -36,4 +36,4 @@ export EVAL_DYNAMIC_THRESHOLD=0.90
 export EVAL_TEMPERATURE=1.0
 export EVAL_EVERY=1
 
-bash /inspire/hdd/global_user/liuxiaoran-240108120089/zhuying/GTPO-Trainer/scripts/rl.sh
+bash scripts/rl.sh
