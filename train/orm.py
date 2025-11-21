@@ -63,6 +63,15 @@ class Format(ORM):
         matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completions]
         return [1.0 if match else 0.0 for match in matches]
 
+class ThinkFormat(ORM):
+    def __call__(self, completions, **kwargs) -> List[float]:
+        """Reward function that checks if the completion has a specific format."""
+        completions = ["<think>"+x for x in completions]
+        pattern = r'^<think>.*?</think>\s*(?![\s\S])'
+        matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completions]
+        return [1.0 if match else 0.0 for match in matches]
+
+
 class Boxed(ORM):
     def __call__(self, completions, **kwargs) -> List[float]:
         extracted_answers = [extract_last_boxed(completion) for completion in completions]
@@ -172,6 +181,7 @@ orms = {
     'accuracy': MathAccuracy,
     'binary': BinaryReward,
     'format': Format,
+    'think_format': ThinkFormat,
     'boxed': Boxed,
     'cosine': CosineReward,
     'repetition': RepetitionPenalty,
