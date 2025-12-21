@@ -9,7 +9,7 @@ experiment:
     save_every: 10
     eval_every: -1
     current_epoch: 1
-    deepspeed_file: "1_node_8_gpus_deepspeed_zero3"
+    deepspeed_file: "deepspeed_zero3"
     num_node: 1
     node_index: 0
 
@@ -27,7 +27,6 @@ dataset:
 
 # also see explanations in eval configs
 rollout:
-    tensor_parallel_size: 1 # set to 1 by default, if oom, try reduce max_active first, if still oom, set tensor_parallel_size to 8
     num_task_per_step: 128
     num_response_per_task: 8
     temperature: 1.0
@@ -39,15 +38,15 @@ rollout:
     remasking_strategy: "low_confidence_dynamic"
     dynamic_threshold: 0.9 # no use for "low_confidence_static"
     start_with_think: False
-    speed: False
+    stop_token_list: ["<|im_end|>", "<|endoftext|>"]
+    do_sample: True
 
 training:
     reward_funcs: "cosine"
     gradient_checkpointing_enable: True
     gradient_accumulation_steps: 1
     batch_size_lm: 1
-    inner_micro_batch_size: 4
-    micro_batch_size: 4 # Split forward pass into smaller batches to save memory. Set to null to disable splitting
+    mini_batch_size: 128
     mixed_precision: "bf16"
     enable_tf32: True
     seed: 10086
@@ -56,12 +55,12 @@ training:
     save_every_iteration: False
     num_train_epochs: 240
     max_grad_norm: 1.0
-    method: "TraceRL"
+    method: "DiPO"
     block_size: 4
     shrink: 1
     post_num: 0
     max_gen_length: 8192
-    max_prompt_len: 2048
+    max_prompt_len: 1024
     lower_p: 0.1
     upper_p: 0.9
     eps: 0.20
@@ -81,10 +80,10 @@ optimizer:
 
 
 lr_scheduler:
-    scheduler: "constant"
+    scheduler: "constant_with_warmup"
     params:
         learning_rate: ${optimizer.params.learning_rate}
-        warmup_steps: 0
+        warmup_steps: 10
         min_lr_scale: 1.0
 
 
@@ -99,6 +98,6 @@ evaluation:
     denoising_steps_per_block: 4
     top_p: 1.0
     top_k: 50
-    remasking_strategy: low_confidence_dynamic 
+    remasking_strategy: "low_confidence_dynamic"
     dynamic_threshold: 0.9 # no use for "low_confidence_static"
     start_with_think: False

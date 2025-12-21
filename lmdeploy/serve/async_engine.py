@@ -50,6 +50,7 @@ class GenOut:
     
     # for DLLM
     step_map: List[int] = None
+    input_ids: List[int] = None
 
 
 def _gen_out_to_response(out: GenOut, index) -> Response:
@@ -719,6 +720,13 @@ class AsyncEngine(LogitsMixin):
         if gen_config.stop_token_ids is None:
             gen_config.stop_token_ids = self.stop_words
         gen_config.update_from_hf_gen_cfg(self.hf_gen_cfg, self.tokenizer.eos_token_id)
+        
+        # Update DLLM dynamic threshold if provided
+        if gen_config.dllm_confidence_threshold is not None:
+            if hasattr(self.engine, 'model_agent') and hasattr(self.engine.model_agent, 'misc_config'):
+                if hasattr(self.engine.model_agent.misc_config, 'dllm_config') and self.engine.model_agent.misc_config.dllm_config is not None:
+                    self.engine.model_agent.misc_config.dllm_config.confidence_threshold = gen_config.dllm_confidence_threshold
+        
         if not gen_config.do_sample:
             # greedy decode
             gen_config.top_k = 1
@@ -764,7 +772,7 @@ class AsyncEngine(LogitsMixin):
             gen_config.max_new_tokens = max(0, self.session_len - self.id2step[session_id] - len(input_ids))
             if gen_config.max_new_tokens == 0:
                 logger.error(f'run out of tokens. session={session_id}.')
-                yield GenOut('', self.id2step[session_id], len(input_ids), 0, 'length')
+                yield GenOut('', self.id2step[session_id], len(input_ids), 0, 'length', input_ids=input_ids)
                 if sequence_end is True and sequence_start is False:
                     await self.end_session(session_id)
                 return
@@ -777,7 +785,8 @@ class AsyncEngine(LogitsMixin):
                          input_token_len=len(input_ids),
                          generate_token_len=0,
                          finish_reason='error',
-                         token_ids=[])
+                         token_ids=[],
+                         input_ids=input_ids)
             return
 
         def is_error(status):
@@ -857,7 +866,8 @@ class AsyncEngine(LogitsMixin):
                                  finish_reason,
                                  token_ids=res,
                                  cache_block_ids=outputs.cache_block_ids,
-                                 step_map=step_map_increment)
+                                 step_map=step_map_increment,
+                                 input_ids=input_ids)
 
                     if outputs.logprobs is not None:
                         log_offset = ids_offset - start_ids_offset
@@ -884,15 +894,17 @@ class AsyncEngine(LogitsMixin):
                         # avoid returning the last response twice
                         response = ''
                     token_ids, logits, last_hidden_state, logprobs = [], None, None, None
-                    # Only add stop token at the end if it wasn't already included in the stream
-                    should_include_stop = (not gen_config.skip_special_tokens) or gen_config.include_stop_str_in_output
-                    if not should_include_stop and gen_config.include_stop_str_in_output and finish_reason == 'stop':
-                        # return the eos token id (MUST be in a list), eos string, eos token's logits and so on
-                        token_ids = outputs.token_ids[-1:]
-                        response = self.tokenizer.decode(token_ids, skip_special_tokens=False)
-                        logits = outputs.logits[-1:] if outputs.logits else None
-                        last_hidden_state = outputs.last_hidden_state[-1:] if outputs.last_hidden_state else None
-                        logprobs = outputs.logprobs[-1:] if outputs.logprobs else None
+                    # NOTE: 这段代码原本有bug，条件永远不会满足，所以注释掉
+                    # 如果用户想要EOS token (should_include_stop=True)，它已经在流式输出中包含了
+                    # 如果用户不想要EOS token (should_include_stop=False)，就不应该在这里加
+                    # should_include_stop = (not gen_config.skip_special_tokens) or gen_config.include_stop_str_in_output
+                    # if not should_include_stop and gen_config.include_stop_str_in_output and finish_reason == 'stop':
+                    #     # return the eos token id (MUST be in a list), eos string, eos token's logits and so on
+                    #     token_ids = outputs.token_ids[-1:]
+                    #     response = self.tokenizer.decode(token_ids, skip_special_tokens=False)
+                    #     logits = outputs.logits[-1:] if outputs.logits else None
+                    #     last_hidden_state = outputs.last_hidden_state[-1:] if outputs.last_hidden_state else None
+                    #     logprobs = outputs.logprobs[-1:] if outputs.logprobs else None
 
                     logger.info(f'session {session_id} finished, reason '
                                 f'"{finish_reason}", input_tokens '
@@ -911,7 +923,8 @@ class AsyncEngine(LogitsMixin):
                                  logits=logits,
                                  last_hidden_state=last_hidden_state,
                                  step_map=final_step_map,
-                                 cache_block_ids=outputs.cache_block_ids)
+                                 cache_block_ids=outputs.cache_block_ids,
+                                 input_ids=input_ids)
                     # Update a session's sequence only when it is in finished status
                     if outputs.status == ResponseType.FINISH:
                         if rewind_stop_tokens:
@@ -926,7 +939,8 @@ class AsyncEngine(LogitsMixin):
                                  input_token_len=len(input_ids),
                                  generate_token_len=0,
                                  finish_reason='error',
-                                 token_ids=[])
+                                 token_ids=[],
+                                 input_ids=input_ids)
             # update step
             if sequence_end:
                 self.id2step[session_id] = 0

@@ -1,0 +1,53 @@
+cd /inspire/hdd/global_user/liuxiaoran-240108120089/zhuying/DiRL
+ps -ef | grep python | awk '{print $2}' | xargs kill -9 # 慎重
+export MODEL=sdar
+export DATASET=BigMath_train
+export TRAIN_DATASET=BigMath_train
+export EVAL_DATASET=MATH500
+export SCRIPT_NAME=rl_sdar_math_512_8_8k_stage3_s1_DAPO_dapo_flex
+# export PRETRAINED_MODEL=/inspire/hdd/global_user/liuxiaoran-240108120089/zhuying/SDAR-RL/sft_sdar_sft_glm_openr1math_8k-woeos/ckpt/checkpoint-epoch-29
+# export PRETRAINED_MODEL=/inspire/hdd/global_user/liuxiaoran-240108120089/zhuying/SDAR-RL/sft_sdar_sft_glm_openr1math_8k-woeos/ckpt/checkpoint-epoch-29
+# export PRETRAINED_MODEL=/inspire/hdd/global_user/liuxiaoran-240108120089/zhuying/DiRL/sft_sdar_8k_latest/ckpt/checkpoint-epoch-35
+# export PRETRAINED_MODEL=/inspire/hdd/global_user/liuxiaoran-240108120089/zhuying/SDAR-1.7B-Chat
+export PRETRAINED_MODEL=xxx/SDAR-8B-Chat
+# export PRETRAINED_MODEL=/inspire/hdd/global_user/liuxiaoran-240108120089/zhuying/SDAR/training/llama_factory_sdar/sdar_ckpt/sdar_8b_math_r1_cot/full/sft/checkpoint-250
+# export PRETRAINED_MODEL=/inspire/hdd/global_user/liuxiaoran-240108120089/public/models/SDAR-8B-Chat
+# export PRETRAINED_MODEL=/inspire/hdd/global_user/liuxiaoran-240108120089/zhuying/DiRL/rl_math_128_16_8k_stage2_s1_dapo_grpo_flex-shrink1_lmdeploy/ckpt/epoch-10
+# export PRETRAINED_MODEL=/inspire/hdd/global_user/liuxiaoran-240108120089/zhuying/SDAR/training/llama_factory_sdar/sdar_ckpt/sdar_8b_math_r1_cot4/full/sft
+# export PRETRAINED_MODEL=/inspire/hdd/global_user/liuxiaoran-240108120089/public/SDAR-8B-Chat
+# export PRETRAINED_MODEL=/inspire/hdd/global_user/liuxiaoran-240108120089/zhuying/DiRL-8B-Instruct
+
+export CURRENT_STEP=1
+export CUSOR=0
+export NUM_TASK_PER_STEP=128
+export NUM_RESPONSE_PER_TASK=8
+export ITERATIONS=1
+export SHRINK=1
+export BS=16
+export MINI_BS=128
+export LR=2e-7
+export REWARD_FUNCS=accuracy
+export SPEED=false
+export NUM_TRAIN_STEPS=500
+export KL=0.0
+export GRADIENT_ACCUMULATION_STEPS=1
+export BLOCK_SIZE=4
+export MAX_TOKEN=2048
+export TOP_K=50
+export TOP_P=1.0
+export TEMPERATURE=1.0
+export DENOISING_STEPS_PER_BLOCK=4
+export REMASKING_STRATEGY=low_confidence_dynamic
+export DYNAMIC_THRESHOLD=0.9
+export SAVE_EVERY=10
+export EVAL_BLOCK_SIZE=4
+export EVAL_DENOISING_STEPS=4
+export EVAL_MAX_TOKEN=2048
+export EVAL_TOP_K=50
+export EVAL_TOP_P=1.0
+export EVAL_REMASKING_STRATEGY=low_confidence_dynamic
+export EVAL_DYNAMIC_THRESHOLD=0.9
+export EVAL_TEMPERATURE=1.0
+export EVAL_EVERY=10
+
+bash scripts/dapo.sh
