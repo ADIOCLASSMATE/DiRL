@@ -116,6 +116,9 @@ class GenerationConfig:
     with_cache: bool = False
     preserve_cache: bool = False
     migration_request: Optional[MigrationRequest] = None
+    
+    # for DLLM dynamic threshold
+    dllm_confidence_threshold: Optional[float] = None
 
     def convert_stop_bad_words_to_ids(self, tokenizer: Tokenizer):
         """Convert stop_words/bad_sords to ids and append the ids to

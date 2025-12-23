@@ -88,7 +88,7 @@ def main():
     stop_token_list = config.rollout.stop_token_list
 
     backend_config = PytorchEngineConfig(
-        dtype="float16",
+        dtype="bfloat16",
         max_prefill_token_num=config.rollout.max_token*32,
         cache_max_entry_count=0.95,
         dllm_block_length=config.rollout.block_size,
@@ -105,8 +105,9 @@ def main():
         do_sample=do_sample, # greedy decoding
         min_new_tokens=128,
         max_new_tokens=config.rollout.max_token,
-        stop_words=["<|endoftext|>"],
+        stop_words=["<|im_end|>"],
         skip_special_tokens=False,
+        bad_words=["<|endoftext|>"],
         # random_seed=10086 if "Qwen" not in model_path else None,
     )
 
@@ -124,11 +125,10 @@ def main():
     gts = ds['ground_truth_answer']
     
     reason_prompt = "<|im_start|>user\n{problem}\nPlease reason step by step, and put your final answer within $\\boxed{{}}$.<|im_end|>\n<|im_start|>assistant\n"
-
-    # reason_prompt = "<|im_start|>user\n{problem}\nPlease reason step by step in <think>...</think>, and put your final answer within $\\boxed{{}}$ in <answer>...</answer>.<|im_end|>\n<|im_start|>assistant\n"
-    # start_with_think=True
+    print(start_with_think)
     if start_with_think:
-        reason_prompt = reason_prompt + "<think>"
+        reason_prompt = "<|im_start|>system\nPlease reason step by step, and put your final answer within $\\boxed{{}}$.<|im_end|>\n<|im_start|>user\n{problem}<|im_end|>\n<|im_start|>assistant\n<think>"
+
     # if "Qwen3" in model_path:
         # reason_prompt = reason_prompt + "<think></think>"
     # 构建带原始索引的数据

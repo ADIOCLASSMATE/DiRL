@@ -1,0 +1,56 @@
+### model
+model_name_or_path: /inspire/hdd/project/high-dimensionaldata/wanjiaxin-253108030048/project/dlm/test/DiRL/public/SDAR-8B-Chat
+train_from_scratch: false
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+freeze_vision_tower: true
+freeze_multi_modal_projector: false
+freeze_language_model: true
+deepspeed: examples/deepspeed/ds_z2_config.json
+# disable_gradient_checkpointing: true
+# gradient_checkpointing: true
+
+### dataset
+dataset: glm_openr1math
+template: qwen3 # qwen2_vl
+block_length: 4
+cutoff_len: 10240
+truncate_mode: drop # choices: [drop, cut] 多模态推荐 drop
+overwrite_cache: true
+tokenized_path: ./s1k_cache
+preprocessing_num_workers: 96
+dataloader_num_workers: 4
+neat_packing: true
+# streaming: true
+# max_steps: 1000
+
+### output
+output_dir: ./sdar_ckpt/sdar_8b_math_s1k/full/sft
+logging_steps: 1
+save_steps: 50
+save_total_limit: 50
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: true
+report_to: wandb  # choices: [none, wandb, tensorboard, swanlab, mlflow]
+
+### train
+run_name: sdar_8b_math_s1k
+include_effective_tokens_per_second: true
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+learning_rate: 1.0e-5
+num_train_epochs: 10
+lr_scheduler_type: constant_with_warmup
+warmup_ratio: 0.03
+bf16: true
+ddp_timeout: 180000000
+# ### eval
+# val_size: 0.05
+# per_device_eval_batch_size: 1
+# eval_strategy: steps
+# eval_steps: 10

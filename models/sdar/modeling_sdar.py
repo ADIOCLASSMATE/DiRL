@@ -21,10 +21,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union, List
 
 import torch
 from torch import nn
+from einops import rearrange
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
@@ -45,6 +46,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, is_torch_flex_attn_available, logging
 from .configuration_sdar import SDARConfig
+from .fused_linear_diffusion_cross_entropy import FusedLinearDiffusionCrossEntropyLoss
 
 from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_rms_norm
 
@@ -68,6 +70,286 @@ if is_torch_flex_attn_available():
 
 
 logger = logging.get_logger(__name__)
+
+
+def modify_padded_position_ids_2d(position_ids: torch.LongTensor) -> torch.LongTensor:
+    """
+    使用完全向量化的 PyTorch 操作修改一个 batch 的 packed position_ids。
+    这个函数假设输入是一个 2D Tensor，形状为 (batch_size, sequence_length)。
+    它会独立地处理 batch 中的每一行。
+
+    Args:
+        position_ids: 二维 PyTorch Tensor, shape (batch_size, sequence_length).
+
+    Returns:
+        修改后的 position_ids Tensor, shape (batch_size, sequence_length).
+    """
+    if position_ids.dim() != 2:
+        raise ValueError(f"Input tensor must be 2D, but got {position_ids.dim()} dimensions.")
+        
+    batch_size, seq_len = position_ids.shape
+    device = position_ids.device
+
+    col_indices = torch.arange(seq_len, device=device, dtype=position_ids.dtype).expand(batch_size, -1)
+    mask = (position_ids != 0)
+
+    masked_indices = col_indices * mask
+    last_nonzero_idx = torch.max(masked_indices, dim=1).values
+    has_nonzero = torch.any(mask, dim=1)
+    pad_start_idx = torch.where(has_nonzero, last_nonzero_idx + 1, torch.tensor(0, device=device, dtype=position_ids.dtype))
+
+    padding_mask = col_indices >= pad_start_idx.unsqueeze(1)
+    new_pad_values = col_indices - pad_start_idx.unsqueeze(1)
+    position_ids = torch.where(padding_mask, new_pad_values, position_ids)
+
+    return position_ids
+
+
+def calculate_token_nums(position_ids: torch.Tensor):
+    """
+    使用 PyTorch 高效计算一个批次中每个打包序列的长度。
+
+    Args:
+        position_ids (torch.Tensor): 一个 2D Tensor，形状为 (batch_size, sequence_length)。
+                                     例如：tensor([[0,1,2,3,4,0,1,2,3,4,5,0,1,2,3,0,0,0]])
+    Returns:
+        list[list[int]]: 一个嵌套列表，包含每个批次项中各个序列的长度。
+                         例如：[[5, 6, 4, 1, 1, 1]]
+    """
+    # 检查输入是否为 2D Tensor
+    if position_ids.dim() != 2:
+        raise ValueError(f"输入必须是 2D Tensor，但得到了 {position_ids.dim()}D")
+
+    all_lengths = []
+    
+    # 我们按批次逐行处理。因为每行的序列长度数量不同（ragged），
+    # 所以 Python 循环在批次维度上是最高效且最清晰的写法。
+    # 循环内部的操作是完全向量化的。
+    for pids_row in position_ids:
+        # 获取当前行的总长度
+        seq_len = pids_row.shape[0]
+        
+        # 1. 找到所有值为 0 的元素的索引
+        # pids_row == 0 会返回一个布尔 Tensor: [True, False, ..., True, ...]
+        # torch.nonzero 会返回这些 True 值的索引
+        # .flatten() 将其从 (N, 1) 形状的 Tensor 变为 (N,) 形状
+        zero_indices = torch.nonzero(pids_row == 0).flatten()
+        
+        # 2. 将序列的总长度作为一个额外的切分点添加到末尾
+        # 这对于计算最后一个序列的长度至关重要
+        # 注意：要确保新创建的 tensor 和原始 tensor 在同一个设备上 (cpu/cuda)
+        split_points = torch.cat([
+            zero_indices,
+            torch.tensor([seq_len], device=pids_row.device, dtype=zero_indices.dtype)
+        ])
+        
+        # 3. 计算相邻切分点之间的差值，这就是我们想要的长度
+        # torch.diff([a, b, c, d]) 会返回 [b-a, c-b, d-c]
+        lengths = torch.diff(split_points)
+
+        all_lengths.append(lengths)
+
+    return all_lengths
+
+
+def forward_add_noise_packed(
+    inputs_ids: torch.Tensor,
+    num_tokens_list: List[torch.Tensor],
+    prompt_mask: torch.Tensor,
+    mask_id: int,
+    eps: float = 1e-3,
+    max_tries: int = 10,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    为一批打包（packed）序列的 token ID 添加噪声。
+
+    此函数保留了为每个逻辑样本（在每个批次项内拼接）生成独立随机噪声率的逻辑。
+    它会随机将一部分 token 的 ID 替换为 mask_id。
+    这个过程会避开被 prompt_mask 标记的位置。
+
+    Args:
+        inputs_ids (torch.Tensor): 
+            输入的 token ID 张量，形状为 (bsz, total_tokens)。
+        num_tokens_list (List[torch.Tensor]): 
+            一个张量列表，长度为 bsz。列表中的每个张量记录了对应批次项中
+            每个逻辑样本的长度。例如: [tensor([len1, len2]), tensor([len3, len4, len5])].
+        prompt_mask (torch.Tensor): 
+            布尔型张量，形状为 (bsz, total_tokens)，值为 True 的位置表示是 prompt，
+            不应添加噪声。
+        mask_id (int): 
+            用于替换的 mask token 的 ID。
+        eps (float): 
+            微小值，用于防止噪声率 t 恰好为 0，确保 p_mask > 0。
+        max_tries (int): 
+            为确保至少一个非 prompt token 被 mask，对每个批次项尝试的最大次数。
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        - noisy_input_ids (torch.Tensor): 
+            添加噪声后的 token ID 张量，形状为 (bsz, total_tokens)。
+        - final_masked_indices (torch.Tensor): 
+            布尔型张量，标记了哪些位置被实际 mask 了，形状为 (bsz, total_tokens)。
+        - p_masks (torch.Tensor): 
+            一个一维张量，包含了被 mask 的 token 对应的实际噪声率。
+    """
+    # 1. 验证和获取形状
+    bsz, total_tokens = inputs_ids.shape
+    device = inputs_ids.device
+
+    # 检查输入的一致性
+    assert len(num_tokens_list) == bsz, f"num_tokens_list 的长度 ({len(num_tokens_list)}) 必须等于 bsz ({bsz})"
+    assert prompt_mask.shape == (bsz, total_tokens), f"prompt_mask 形状不匹配, 期望 {(bsz, total_tokens)}, 得到 {prompt_mask.shape}"
+
+    # 准备结果容器
+    noisy_ids_list = []
+    final_masked_indices_list = []
+    p_masks_per_token_list = []
+
+    # 2. 在批次维度上迭代
+    # 这是处理不同打包结构最直接有效的方法
+    for i in range(bsz):
+        # 提取当前批次项的数据
+        current_ids = inputs_ids[i:i+1] # shape: (1, total_tokens)
+        current_num_tokens = num_tokens_list[i]
+        current_prompt_mask = prompt_mask[i:i+1] # shape: (1, total_tokens)
+        
+        num_samples_in_item = len(current_num_tokens)
+        # 验证当前批次项的 token 总数是否匹配
+        assert total_tokens == torch.sum(current_num_tokens), \
+            f"批次项 {i} 的 num_tokens 之和 ({torch.sum(current_num_tokens)}) 与 total_tokens ({total_tokens}) 不匹配"
+
+        eligible_for_masking = ~current_prompt_mask
+
+        # 如果没有任何 token 可以被 mask，直接使用原始输入，并设置 p_mask 为 eps
+        if not eligible_for_masking.any():
+            noisy_ids_list.append(current_ids)
+            final_masked_indices_list.append(torch.zeros_like(current_prompt_mask, dtype=torch.bool))
+            # p_mask_per_token 的形状应为 (1, total_tokens) 以便后续拼接
+            p_masks_per_token_list.append(torch.full((1, total_tokens), eps, device=device, dtype=torch.float))
+            continue
+
+        # --- 尝试生成 mask，确保至少 mask 一个 token ---
+        final_masked_indices_item = torch.zeros_like(current_prompt_mask, dtype=torch.bool)
+        p_mask_per_token = None
+        
+        for _ in range(max_tries):
+            # 为每个逻辑样本生成一个独立的噪声率 t
+            t = torch.rand(num_samples_in_item, device=device)
+            p_mask_per_sample = (1 - eps) * t + eps
+
+            # 将每个样本的噪声率扩展到其所有 token 上
+            p_mask_per_token_1d = torch.repeat_interleave(p_mask_per_sample, current_num_tokens)
+            p_mask_per_token = p_mask_per_token_1d.unsqueeze(0) # shape: (1, total_tokens)
+
+            # 根据噪声率生成随机 mask
+            masked_indices = torch.rand_like(p_mask_per_token) < p_mask_per_token
+            # 应用 prompt mask，确保 prompt 不被 mask
+            final_masked_indices_item = masked_indices & eligible_for_masking
+
+            # 如果成功 mask 了至少一个 token，则跳出尝试循环
+            if final_masked_indices_item.any():
+                break
+        
+        # 如果 max_tries 之后仍然没有 mask 任何 token (极小概率)，就强制 mask 一个可 mask 的 token
+        if not final_masked_indices_item.any():
+            eligible_indices = torch.nonzero(eligible_for_masking.squeeze(0), as_tuple=True)[0]
+            if len(eligible_indices) > 0:
+                # 随机选择一个可 mask 的位置
+                random_choice = torch.randint(0, len(eligible_indices), (1,)).item()
+                force_mask_idx = eligible_indices[random_choice]
+                final_masked_indices_item[0, force_mask_idx] = True
+
+
+        # --- 根据最终的 mask 生成带噪声的 IDs ---
+        noisy_ids_item = torch.where(
+            final_masked_indices_item,
+            mask_id,
+            current_ids
+        )
+        
+        # 保存这个批次项的结果
+        noisy_ids_list.append(noisy_ids_item)
+        final_masked_indices_list.append(final_masked_indices_item)
+        p_masks_per_token_list.append(p_mask_per_token)
+
+    # 3. 将列表中的结果堆叠成最终的批处理张量
+    noisy_input_ids = torch.cat(noisy_ids_list, dim=0)
+    final_masked_indices = torch.cat(final_masked_indices_list, dim=0)
+    p_mask_full = torch.cat(p_masks_per_token_list, dim=0)
+    
+    # 4. 提取被 mask 位置对应的噪声率
+    p_masks = p_mask_full[final_masked_indices]
+    
+    return noisy_input_ids, final_masked_indices, p_masks
+
+
+def block_diff_mask(b, h, q_idx, kv_idx, block_size=None, n=None):
+    """
+    Constructs the specialized block diffusion attention mask for training
+    composed of three masks:
+    - **Block Diagonal Mask (M_BD)**: Self-attention within noised blocks
+    - **Offset Block Causal Mask (M_OBC)**: Cross-attention for conditional context
+    - **Block Causal Mask (M_BC)**: Attention to update x0
+
+    Args:
+        b, h: Batch and head indices (ignored for mask logic).
+        q_idx, kv_idx: Query and Key indices.
+        seq_len: Total sequence length.
+        block_size: Defines the block structure.
+
+    Returns:
+        A boolean attention mask.
+    """
+
+    # Indicate whether token belongs to xt or x0
+    x0_flag_q = q_idx >= n
+    x0_flag_kv = kv_idx >= n
+
+    # Compute block indices
+    block_q = torch.where(
+        x0_flag_q == 1, (q_idx - n) // block_size, q_idx // block_size
+    )
+    block_kv = torch.where(
+        x0_flag_kv == 1, (kv_idx - n) // block_size, kv_idx // block_size
+    )
+
+    # **1. Block Diagonal Mask (M_BD) **
+    block_diagonal = (block_q == block_kv) & (x0_flag_q == x0_flag_kv)
+
+    # **2. Offset Block-Causal Mask (M_OBC) **
+    offset_block_causal = (block_q > block_kv) & (
+        x0_flag_kv == 1) & (x0_flag_q == 0)
+
+    # **3. Block-Causal Mask (M_BC) **
+    block_causal = (block_q >= block_kv) & (x0_flag_kv == 1) & (x0_flag_q == 1)
+
+    # **4. Combine Masks **
+    return block_diagonal | offset_block_causal | block_causal
+
+
+def block_attn_mask(num_tokens, block_size, device):
+    masks = []
+    for i in range(len(num_tokens)):
+        cur_masks = []
+        for num in num_tokens[i]:
+            # 全部返回 n*n 而非 2n*2n
+            single_mask = block_diff_mask(
+                b=None,
+                h=None,
+                q_idx=torch.arange(num * 2, device=device)[:, None],
+                kv_idx=torch.arange(num * 2, device=device)[None, :],
+                block_size=block_size,
+                n=num,
+            )
+            cur_masks.append(single_mask)
+        masks.append(torch.block_diag(*cur_masks))
+    masks = torch.stack(masks, dim=0)
+    return masks
+
+
+@torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
+def fused_flex_attention(query, key, value, attention_mask, **kwargs):
+    return flex_attention(query, key, value, block_mask=attention_mask, **kwargs)
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -128,6 +410,7 @@ def rotate_half(x):
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
+
     Args:
         q (`torch.Tensor`): The query tensor.
         k (`torch.Tensor`): The key tensor.
@@ -254,8 +537,6 @@ class SDARAttention(nn.Module):
             hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(
             hidden_shape).transpose(1, 2)
-        
-        
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(
@@ -273,96 +554,47 @@ class SDARAttention(nn.Module):
             value_states = torch.cat(
                 [past_value_states, value_states], dim=-2)
 
-        '''
-        attention_mask = attention_mask.bool() if attention_mask is not None else None
-        if torch.all(attention_mask):  # decoding
-            query_states = query_states.transpose(1, 2)
-            key_states = key_states.transpose(1, 2)
-            value_states = value_states.transpose(1, 2)
-            attn_output = flash_attn_func(
-                query_states,
-                key_states,
-                value_states,
-                causal=False,
-                softmax_scale=self.scaling
-            )
-
-        else:  # prefilling
-            attn_output = F.scaled_dot_product_attention(
+        if self.training:
+            attn_output, attn_weights = fused_flex_attention(
                 query=query_states,
                 key=key_states,
                 value=value_states,
-                attn_mask=attention_mask,
-                is_causal=False,
+                attention_mask=attention_mask,
+                enable_gqa=True,
                 scale=self.scaling,
-                enable_gqa=True
+                return_lse=True
             )
-            attn_output = attn_output.transpose(1, 2).contiguous()
-        '''
-
-        #print(query_states.shape, key_states.shape, value_states.shape)
-
-        # --- After RoPE and KV-cache handling, expand KV to all heads ---
-        key_states   = repeat_kv(key_states,   self.num_key_value_groups)  # [B, H, K, D]
-        value_states = repeat_kv(value_states, self.num_key_value_groups)  # [B, H, K, D]
-
-        # --- Convert a 0/1 or bool 4D mask into an *additive* mask, and align to [B, H, Q, K] ---
-        attn_mask = None
-        if attention_mask is not None:
-            k_len = key_states.shape[-2]
-            am = attention_mask
-            # Support either 2D [B, K] or 4D [B, 1/H, Q, K]
-            if am.dim() == 2:
-                am = am[:, None, None, :k_len]             # -> [B,1,1,K]
-            else:
-                am = am[:, :, :, :k_len]                   # -> [B,1/H,Q,K]
-
-            finfo_min = torch.finfo(query_states.dtype).min
-            # 0/1 or bool -> float additive mask: 1->0, 0->-inf
-            if am.dtype == torch.bool:
-                zero   = torch.zeros((), dtype=query_states.dtype, device=am.device)
-                neginf = torch.full((), finfo_min, dtype=query_states.dtype, device=am.device)
-                am = torch.where(am, zero, neginf)
-            else:
-                # For 0/1 float masks: values > 0 are treated as visible
-                am = am.to(query_states.dtype)
-                am = torch.where(am > 0, torch.zeros_like(am), torch.full_like(am, finfo_min))
-
-            # Expand to all heads
-            #if am.shape[1] == 1 and self.num_attention_heads > 1:
-            #    am = am.expand(am.shape[0], self.num_attention_heads, am.shape[2], am.shape[3])
-
-            #attn_mask = am.contiguous()
-            attn_mask = am
-        
-
-        bsz, q_len = input_shape
-
-        if q_len == 1 and past_key_value is not None:
-            # --- Decoding: flash-attn ---
-            q = query_states.transpose(1, 2)  # [B,Q,H,D]
-            k = key_states.transpose(1, 2)
-            v = value_states.transpose(1, 2)
-            attn_output = flash_attn_func(
-                q, k, v,
-                causal=True,                # For decoding, explicitly set causal=True
-                softmax_scale=self.scaling
-            )
-            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_weights = attn_weights.to(
+                value_states.dtype) if attn_weights is not None else None
+            attn_output = rearrange(attn_output, 'b h l d -> b l (h d)')
         else:
-            attn_output = F.scaled_dot_product_attention(
-                query=query_states,         # [B,H,Q,D]
-                key=key_states,             # [B,H,K,D]
-                value=value_states,         # [B,H,K,D]
-                attn_mask=attn_mask,        # float additive mask
-                is_causal=False,            # All constraints are already encoded in the mask
-                scale=self.scaling,
-            )
-            attn_output = attn_output.transpose(1, 2).contiguous()  # -> [B,Q,H,D]
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attention_mask = attention_mask.bool() if attention_mask is not None else None
+            attn_weights = None
+            if torch.all(attention_mask):  # decoding
+                query_states = query_states.transpose(1, 2)
+                key_states = key_states.transpose(1, 2)
+                value_states = value_states.transpose(1, 2)
+                attn_output = flash_attn_func(
+                    query_states,
+                    key_states,
+                    value_states,
+                    causal=False,
+                    softmax_scale=self.scaling
+                )
+                attn_output = rearrange(attn_output, 'b l h d -> b l (h d)')
+            else:  # prefilling
+                attn_output = F.scaled_dot_product_attention(
+                    query=query_states,
+                    key=key_states,
+                    value=value_states,
+                    attn_mask=attention_mask,
+                    is_causal=False,
+                    scale=self.scaling,
+                    enable_gqa=True
+                )
+                attn_output = rearrange(attn_output, 'b h l d -> b l (h d)')
         attn_output = self.o_proj(attn_output)
-        return attn_output, None  # , attn_weights
+        return attn_output, attn_weights  # , attn_weights
 
 
 class SDARDecoderLayer(GradientCheckpointingLayer):
@@ -738,6 +970,7 @@ class SDARModel(SDARPreTrainedModel):
         """
         Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
         `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
+
         Args:
             attention_mask (`torch.Tensor`):
                 A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape `(batch_size, 1, query_length, key_value_length)`.
@@ -833,6 +1066,79 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
+    def prepare_for_bd_training(self, inputs_ids, position_ids, prompt_mask, masked_indices=None, p_mask_input=None):
+        bsz, seq_len = inputs_ids.shape
+        num_tokens = calculate_token_nums(position_ids) # List[torch.Tensor]
+        
+        # 如果手动传入了 masked_indices，就直接用它
+        if masked_indices is not None:
+            # 手动mask模式：用于RL训练或固定mask实验
+            # 注意：外部传入的masked_indices已经只在response部分（通过 & response_mask），不需要再次过滤
+            noisy_inputs_ids = torch.where(masked_indices, self.config.mask_token_id, inputs_ids)
+            logits_to_keep_half = masked_indices  # (B, L) bool
+            # 生成默认的p_mask：扁平化后的噪声率，形状为(M,)，其中M=sum(masked_indices)
+            # 默认值0.5表示中等噪声水平（用于扩散loss）
+            M = masked_indices.sum().item()
+            p_mask = torch.full((M,), 0.5, device=inputs_ids.device, dtype=torch.float)
+        else:
+            # 随机mask模式：用于Block Diffusion预训练
+            # 返回：noisy_inputs_ids (B, L), logits_to_keep_half (B, L) bool, p_mask (M,) float
+            noisy_inputs_ids, logits_to_keep_half, p_mask = forward_add_noise_packed(
+                inputs_ids=inputs_ids,
+                num_tokens_list=num_tokens,
+                prompt_mask=prompt_mask,
+                mask_id=self.config.mask_token_id,
+            )
+        
+        # 确保两个分支返回的形状一致
+        # logits_to_keep_half: (B, L) bool - 标记哪些位置被mask
+        # p_mask: (M,) float - 每个被mask位置的噪声率，其中M = sum(logits_to_keep_half)
+        assert logits_to_keep_half.shape == (bsz, seq_len), f"logits_to_keep_half shape error: {logits_to_keep_half.shape}"
+        assert p_mask.shape == (logits_to_keep_half.sum(),), f"p_mask shape error: {p_mask.shape}, expected ({logits_to_keep_half.sum()},)"
+        
+        # 如果提供了p_mask_input（用于RL训练），计算p_to_keep
+        # p_to_keep表示从masked位置中选出p_mask=True的位置
+        p_to_keep = None
+        if p_mask_input is not None:
+            # 注意：外部传入的p_mask_input已经只在response部分（通过 & response_mask），不需要再次过滤
+            # p_mask_input (B, L), logits_to_keep_half (B, L)
+            # p_to_keep (M,) bool，其中M=sum(logits_to_keep_half)
+            p_to_keep = p_mask_input[logits_to_keep_half]
+        
+        router_noisy_part_list = []
+        for i in range(bsz):
+            cur_router_noisy_part = (torch.arange(num_tokens[i].shape[0] *2) % 2 == 0).to(inputs_ids.device)
+            cur_router_noisy_part = cur_router_noisy_part.repeat_interleave(num_tokens[i].repeat_interleave(2))
+            router_noisy_part_list.append(cur_router_noisy_part)
+        router_noisy_part = torch.stack(router_noisy_part_list, dim=0)
+
+        # concated inputs_ids: (bzs, seq_len x 2)
+        concat_inputs_ids = inputs_ids.repeat(1, 2)
+        # concated logits_to_keep: (bsz, seq_len x 2)
+        logits_to_keep = torch.zeros(
+                    bsz, 2 * seq_len, dtype=torch.bool, device=inputs_ids.device)
+        # concated position_ids: (bsz, seq_len x 2)
+        concat_position_ids = torch.zeros(
+                    bsz, 2 * seq_len, dtype=position_ids.dtype, device=position_ids.device)
+        for i in range(bsz):
+            concat_inputs_ids[i][router_noisy_part[i]] = noisy_inputs_ids[i]
+            concat_inputs_ids[i][~router_noisy_part[i]] = inputs_ids[i]
+
+            logits_to_keep[i][router_noisy_part[i]] = logits_to_keep_half[i]
+
+            concat_position_ids[i][router_noisy_part[i]] = position_ids[i]
+            concat_position_ids[i][~router_noisy_part[i]] = position_ids[i]
+
+        # create flex_attention mask
+        attention_mask = block_attn_mask(num_tokens, self.config.block_size, inputs_ids.device)
+        flex_attention_mask_3d = create_block_mask(
+                            lambda b, h, q_idx, kv_idx: attention_mask[b, q_idx, kv_idx],
+                            B=attention_mask.size(0), H=None,
+                            Q_LEN=attention_mask.size(1), KV_LEN=attention_mask.size(2),
+        )
+
+        return concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, p_mask, p_to_keep
+
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -848,71 +1154,235 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        masked_indices: Optional[torch.Tensor] = None,
+        return_logits: bool = False,
+        # RL training parameters
+        compute_rl_loss: bool = False,
+        p_mask: Optional[torch.Tensor] = None,
+        adv: Optional[torch.Tensor] = None,
+        logp_old_tok: Optional[torch.Tensor] = None,
+        logp_ref_tok: Optional[torch.Tensor] = None,
+        is_real: Optional[torch.Tensor] = None,
+        ppo_eps: float = 0.2,
+        kl_beta: float = 0.0,
+        use_kl_estimator_k3: bool = True,
+        return_entropy: bool = False,
+        dynamic_threshold: Optional[float] = None,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> CausalLMOutputWithPast:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-        Example:
-        ```python
-        >>> from transformers import AutoTokenizer, SDARForCausalLM
-        >>> model = SDARForCausalLM.from_pretrained("DiffuOpen/SDAR-1.7B-Chat")
-        >>> tokenizer = AutoTokenizer.from_pretrained("DiffuOpen/SDAR-1.7B-Chat")
-        >>> prompt = "Hey, are you conscious? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
-        ```"""
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs: BaseModelOutputWithPast = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            cache_position=cache_position,
-            **kwargs,
-        )
+        if self.training:
+            assert inputs_embeds is None, "only support input_ids during training"
 
-        hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep,
-                              None) if isinstance(logits_to_keep, int) else logits_to_keep
-        hidden_states = hidden_states[:, slice_indices, :].contiguous()
-        fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
-        if fuse_linear_and_cross_entropy:
-            # When using fused_linear_ce_loss, we do not compute the whole logits on HBM
-            logits = None
+            prompt_mask = (labels == -100) if labels is not None else None
+            position_ids = modify_padded_position_ids_2d(position_ids)
+
+            (
+                concat_inputs_ids,
+                concat_position_ids,
+                flex_attention_mask_3d,
+                logits_to_keep_half,
+                logits_to_keep,
+                p_mask_out,
+                p_to_keep,
+            ) = self.prepare_for_bd_training(
+                input_ids, position_ids, prompt_mask, masked_indices, p_mask_input=p_mask
+            )
+
+            outputs = self.model(
+                input_ids=concat_inputs_ids,
+                attention_mask=flex_attention_mask_3d,
+                position_ids=concat_position_ids,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+            hidden_states = outputs.last_hidden_state
+            hidden_states = hidden_states[logits_to_keep].contiguous()
+
+            # 初始化 entropy
+            entropy = torch.tensor(0.0, device=input_ids.device)
+
+            # ====================== RL loss（PPO） ======================
+            if compute_rl_loss:
+                assert p_to_keep is not None, "p_mask must be provided for RL loss computation."
+                assert adv is not None, "adv must be provided for RL loss computation."
+                assert is_real is not None, "is_real must be provided for RL loss computation."
+                assert labels is not None, "labels must be provided for RL loss computation."
+                assert masked_indices is not None, "masked_indices must be provided for RL loss computation."
+
+                device = input_ids.device
+
+                # logits (M, V) — 保持原样
+                logits = self.lm_head(hidden_states)
+
+                # mask — 保持原样
+                is_real_tensor = (
+                    is_real.to(device=device, dtype=torch.bool)
+                    if torch.is_tensor(is_real)
+                    else torch.tensor(is_real, dtype=torch.bool, device=device)
+                )
+                p_mask_real = p_mask & is_real_tensor.unsqueeze(1)      # (B, L)
+                p_to_keep_real = p_mask_real[masked_indices]            # (M,) bool
+
+                # 选出 logits — 保持原样
+                logits_p = logits[p_to_keep_real]                       # (N, V)
+                N = p_to_keep_real.sum().item()
+                total_response_tokens = (labels != -100).sum().item()
+                total_p_mask = p_mask.sum().item()
+                total_masked_indices = masked_indices.sum().item()
+                total_is_real = is_real_tensor.sum().item() if is_real_tensor.dim() > 0 else (1 if is_real_tensor.item() else 0)
+                # print(f"Batch stats:")
+                # print(f"  M (logits after logits_to_keep): {len(logits)}")
+                # print(f"  N (p_to_keep_real): {N}")
+                # print(f"  Response tokens (labels!=-100): {total_response_tokens}")
+                # print(f"  p_mask total: {total_p_mask}")
+                # print(f"  masked_indices total: {total_masked_indices}")
+                # print(f"  is_real count: {total_is_real}, batch_size: {labels.shape[0]}")
+                # print(f"  M/N ratio: {len(logits)/N if N > 0 else 0:.2f}, masked_indices/p_mask ratio: {total_masked_indices/total_p_mask if total_p_mask > 0 else 0:.2f}")
+
+                # log_softmax
+                log_probs_p = torch.nn.functional.log_softmax(logits_p, dim=-1)
+
+                # labels / logp — 保持原样
+                labels_p = labels[masked_indices][p_to_keep_real]        # (N,)
+                logp_p = log_probs_p.gather(dim=-1, index=labels_p.unsqueeze(-1)).squeeze(-1)
+                
+                # 过滤掉 token id 为 151645 和 151643 的位置，不参与 loss 计算
+                valid_token_mask = (labels_p != 151645) & (labels_p != 151643)
+
+                # entropy（可选）
+                if return_entropy:
+                    with torch.no_grad():
+                        entropy_p = -(log_probs_p.exp() * log_probs_p).sum(dim=-1)
+                        entropy = entropy_p[valid_token_mask].mean() if valid_token_mask.any() else torch.tensor(0.0, device=device)
+                        del entropy_p
+
+                # advantage — 保持原样
+                adv_tensor = adv.to(device) if torch.is_tensor(adv) else torch.tensor(adv, dtype=torch.float, device=device)
+                adv_expanded = adv_tensor.unsqueeze(1).expand_as(p_mask)
+                adv_p = adv_expanded[masked_indices][p_to_keep_real]
+
+                # old logp
+                if logp_old_tok is not None and logp_old_tok.numel() > 0:
+                    logp_old_p = logp_old_tok.to(device)[masked_indices][p_to_keep_real]
+                else:
+                    logp_old_p = logp_p.detach()
+                
+                # 应用 valid_token_mask 过滤
+                logp_p = logp_p[valid_token_mask]
+                adv_p = adv_p[valid_token_mask]
+                logp_old_p = logp_old_p[valid_token_mask]
+
+                # dynamic_threshold（你原来写了说明但没用；这里不擅自加逻辑，完全不动）
+                _ = dynamic_threshold  # noqa: F841
+
+                # ratio/exp
+                ratio_p = (logp_p - logp_old_p).clamp(-10.0, 10.0).exp()
+                clipped = ratio_p.clamp(1 - ppo_eps, 1 + ppo_eps+0.08)
+                surrogate_p = torch.minimum(ratio_p * adv_p, clipped * adv_p)
+                # 输出离1最远的ratio值
+                # if not torch.allclose(ratio_p, torch.ones_like(ratio_p)):
+                furthest_value = ratio_p[torch.abs(ratio_p - 1).argmax()]
+                # print(f"Furthest ratio from 1: {furthest_value.item()}")
+                policy_loss = -surrogate_p.mean()
+
+                # KL（可选）
+                kl_loss = torch.tensor(0.0, device=device)
+                if kl_beta > 0 and logp_ref_tok is not None:
+                    logp_ref_p = logp_ref_tok.to(device)[masked_indices][p_to_keep_real]
+                    logp_ref_p = logp_ref_p[valid_token_mask]
+                    kl_seq_p = logp_p - logp_ref_p
+
+                    if use_kl_estimator_k3:
+                        kl_seq_p = (-kl_seq_p).clamp(-10.0, 10.0).exp() - 1.0 + kl_seq_p
+
+                    kl_loss = kl_beta * kl_seq_p.mean()
+                    del logp_ref_p, kl_seq_p
+
+                loss = policy_loss + kl_loss
+                kl_loss_value = kl_loss.detach().clone()
+
+                # 清理
+                del logits, logits_p, log_probs_p, labels_p, valid_token_mask
+                del is_real_tensor, p_mask_real, p_to_keep_real
+                del adv_tensor, adv_expanded, adv_p
+                del logp_p, logp_old_p, ratio_p, clipped, surrogate_p
+                del policy_loss, kl_loss
+
+                logits = None
+
+            # ====================== GRPO / return logits ======================
+            elif return_logits:
+                logits = self.lm_head(hidden_states)
+                loss = None
+
+            # ====================== Block Diffusion fused loss ======================
+            else:
+                assert labels is not None, "Labels must be provided for training."
+                answer_len = (labels != -100).sum()
+                loss_fct = FusedLinearDiffusionCrossEntropyLoss(reduction="sum")
+                loss = loss_fct(
+                    x=hidden_states,
+                    target=labels[logits_to_keep_half].contiguous(),
+                    weight=self.lm_head.weight,
+                    bias=self.lm_head.bias,
+                    p_mask=p_mask_out,
+                )
+                loss = loss / answer_len
+                logits = None
+
+        # ====================== eval / inference ======================
         else:
-            logits = self.lm_head(hidden_states)
+            outputs: BaseModelOutputWithPast = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                cache_position=cache_position,
+                **kwargs,
+            )
 
-        loss = None
-        if labels is not None:
-            # FusedLinearCrossEntropyLoss will be implemented by monkey patch when training
-            # We don't use it when inferencing
-            loss_fct = nn.CrossEntropyLoss()  # nn.CE
-            loss = loss_fct(
-                logits.view(-1, self.config.vocab_size), labels.view(-1))
+            hidden_states = outputs.last_hidden_state
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            hidden_states = hidden_states[:, slice_indices, :].contiguous()
 
-        return CausalLMOutputWithPast(
+            fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
+            if fuse_linear_and_cross_entropy:
+                logits = None
+            else:
+                logits = self.lm_head(hidden_states)
+
+            loss = None
+            if labels is not None:
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+
+        output = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+        if self.training and compute_rl_loss:
+            output.entropy = entropy
+            output.kl_loss = kl_loss_value if "kl_loss_value" in locals() else torch.tensor(0.0, device=input_ids.device)
+
+        return output
 
 
 __all__ = [
