@@ -234,7 +234,7 @@ bash examples/example-grpo.sh
 
 ## 👏 Acknowledgement
 
-We would like to express our gratitude to the following works ([SDAR](https://github.com/JetAstra/SDAR), [dllm-RL](https://github.com/Gen-Verse/dLLM-RL), [lmdeploy](https://github.com/InternLM/lmdeploy),[LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory)) for providing important theoretical foundations and inspiration for DiRL.
+We would like to express our gratitude to the following works ([LLaDA](https://github.com/ML-GSAI/LLaDA),[SDAR](https://github.com/JetAstra/SDAR), [dllm-RL](https://github.com/Gen-Verse/dLLM-RL), [lmdeploy](https://github.com/InternLM/lmdeploy),[LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory)) for providing important theoretical foundations and inspiration for DiRL.
 
 ## 💬 Community
 
